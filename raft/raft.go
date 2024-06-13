@@ -391,10 +391,9 @@ func (r *Raft) becomeLeader() {
 		Term:  r.Term,
 		Index: n,
 	}
-	r.RaftLog.entries = append(r.RaftLog.entries, no_op)
 
-	r.Prs[r.id].Match = r.RaftLog.LastIndex()
-	r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
+	// bug: 提交no_op要通过appendEntry函数进行，函数中特判了集群中仅有一个节点的情况
+	r._appendEntry([]*pb.Entry{&no_op})
 	r._send_append_to_all()
 }
 
@@ -516,13 +515,13 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 	agree_count := 0
 	for _, v := range r.votes {
 		if v {
-			agree_count ++
+			agree_count++
 		}
 	}
 	if agree_count > (len(r.Prs) / 2) {
 		// 收到大多数同意
 		r.becomeLeader()
-	} else if len(r.votes) - agree_count > (len(r.Prs) / 2) {
+	} else if len(r.votes)-agree_count > (len(r.Prs) / 2) {
 		// 收到大多数失败
 		r.becomeFollower(r.Term, None)
 	}
@@ -705,6 +704,23 @@ func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
 }
 
+// For lab2B, return the SoftState for Raft State-Machine
+func (r *Raft) softState() *SoftState {
+	return &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+}
+
+// For lab2B, return the HardState for Raft State-Machine
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
 /*
 	the following section are the new function I added.
 	the function names start with '_'
@@ -834,7 +850,6 @@ func (r *Raft) _appendEntry(es []*pb.Entry) {
 	if len(r.Prs) == 1 {
 		r._maybeCommit()
 	}
-
 }
 
 /*

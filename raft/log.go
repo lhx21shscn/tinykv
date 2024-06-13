@@ -122,7 +122,7 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	commitedIndex := l.committed
 	if len(l.entries) > 1 {
 		if appliedIndex >= dummyIndex && appliedIndex < commitedIndex && commitedIndex <= l.LastIndex() {
-			return l.entries[appliedIndex-dummyIndex+1 : commitedIndex-dummyIndex+1]
+			return l.entries[appliedIndex-dummyIndex + 1 : commitedIndex-dummyIndex + 1]
 		}
 	}
 	return make([]pb.Entry, 0)
