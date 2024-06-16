@@ -306,8 +306,44 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
+
+// stabled指示哪些日志被持久化了
+// 在Raft状态机中，如果有持久化的日志被删除了，那么stabled会回退！！
+// 所以当Ready收到需要持久化的日志时，删除Index重合的，不重合的直接添加
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	if len(entries) == 0 {
+		return nil
+	}
+
+	unstableFirstIndex := entries[0].Index
+	unstableLastIndex := entries[len(entries)-1].Index
+	unstableLastTerm := entries[len(entries)-1].Term
+	stableFirstIndex, _ := ps.FirstIndex()
+	stableLastIndex, _ := ps.LastIndex()
+
+	if unstableFirstIndex > stableLastIndex+1 {
+		panic("要持久化的日志和已经持久化的日志出现空洞？？")
+	}
+
+	if unstableFirstIndex < stableFirstIndex {
+		panic("要持久化的日志已经被快照了？？")
+	}
+
+	// Set
+	for _, en := range entries {
+		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, en.Index), &en)
+	}
+	// Delete conflict
+	for i := unstableLastIndex + 1; i <= stableLastIndex; i++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
+	}
+	// Update LastLogIndex and LastLogTerm
+	ps.raftState.LastIndex = unstableLastIndex
+	ps.raftState.LastTerm = unstableLastTerm
+	// Write HardState and LastLogIndex to Raft Engine
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+
 	return nil
 }
 
@@ -331,7 +367,27 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
-	return nil, nil
+	raftWB := engine_util.WriteBatch{}
+
+	// Snapshot
+
+	// HardState(Vote, Term, Committed)
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+
+	// Stabled Entry And Update the LastLogIndex and LastLogTerm
+	var err error
+	err = ps.Append(ready.Entries, &raftWB)
+	if err != nil {
+		return nil, err
+	}
+
+	err = ps.Engines.WriteRaft(&raftWB)
+	if err != nil {
+		return nil, err
+	}
+	return nil, err
 }
 
 func (ps *PeerStorage) ClearData() {

@@ -24,7 +24,13 @@ import (
 //  snapshot/first.....applied....committed....stabled.....last
 //  --------|------------------------------------------------|
 //                            log entries
-//
+
+// 我淘他猴子，别被这张图蒙骗了, stabled和commited没有大小关系
+// stabled仅仅指示哪些日志被持久化了，
+// 在Raft状态机中，如果有持久化的日志被删除了，那么stabled会回退！！
+// 所以当Ready收到需要持久化的日志时，删除Index重合的，不重合的直接添加
+
+// 
 // for simplify the RaftLog implement should manage all log entries
 // that not truncated
 type RaftLog struct {
