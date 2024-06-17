@@ -212,6 +212,7 @@ func (r *Raft) sendRequestVote(to uint64) {
 	}
 
 	lastLogIndex := r.RaftLog.LastIndex()
+	// err must be nil
 	lastLogTerm, _ := r.RaftLog.Term(lastLogIndex)
 
 	msg := pb.Message{
@@ -247,30 +248,42 @@ func (r *Raft) sendAppend(to uint64) bool {
 
 	nextIndex := r.Prs[to].Next
 	lastIndex := r.RaftLog.LastIndex()
+	firstIndex := r.RaftLog.FirstIndex()
 
 	if nextIndex > lastIndex+1 {
 		panic("incorrect relationship between nextIndex and lastIndex")
 	}
-	prevLogIndex := nextIndex - 1
-	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
 
-	firstIndex := r.RaftLog.entries[0].Index
-	var entries []*pb.Entry
-	for i := nextIndex; i <= r.RaftLog.LastIndex(); i++ {
-		entries = append(entries, &r.RaftLog.entries[i-firstIndex])
+	// 发送AppendEntries RPC
+	if nextIndex >= firstIndex {
+		prevLogIndex := nextIndex - 1
+		// err must be nil
+		prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
+
+		dummyIndex := firstIndex - 1
+		var entries []*pb.Entry
+		for i := nextIndex; i <= r.RaftLog.LastIndex(); i++ {
+			entries = append(entries, &r.RaftLog.entries[i-dummyIndex])
+		}
+
+		msg := pb.Message{
+			MsgType: pb.MessageType_MsgAppend,
+			To:      to,
+			From:    r.id,
+			Term:    r.Term,
+			LogTerm: prevLogTerm,
+			Index:   prevLogIndex,
+			Entries: entries,
+			Commit:  r.RaftLog.committed,
+		}
+		r.msgs = append(r.msgs, msg)
+		return true
+	} else {
+		// 发送InstallSnapshot RPC
+		isSend := r.sendSnapshot(to)
+		return isSend
 	}
 
-	msg := pb.Message{
-		MsgType: pb.MessageType_MsgAppend,
-		To:      to,
-		From:    r.id,
-		Term:    r.Term,
-		LogTerm: prevLogTerm,
-		Index:   prevLogIndex,
-		Entries: entries,
-		Commit:  r.RaftLog.committed,
-	}
-	r.msgs = append(r.msgs, msg)
 	return true
 
 }
@@ -314,6 +327,24 @@ func (r *Raft) sendHeartbeatResponse(to uint64) {
 		Term:    r.Term,
 	}
 	r.msgs = append(r.msgs, msg)
+}
+
+func (r *Raft) sendSnapshot(to uint64) bool {
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	if err != nil {
+		return false
+	}
+
+	// 从snapshot数据中获取LastIncludedIndex和LastIncludedTerm
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		From:     r.id,
+		To:       to,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	}
+	r.msgs = append(r.msgs, msg)
+	return true
 }
 
 // func (r *Raft) send(msg pb.Message) {
@@ -366,7 +397,6 @@ func (r *Raft) becomeCandidate() {
 	if len(r.Prs) == 1 {
 		r.becomeLeader()
 	}
-
 }
 
 // becomeLeader transform this peer's state to leader
@@ -392,7 +422,7 @@ func (r *Raft) becomeLeader() {
 		Index: n,
 	}
 
-	// bug: 提交no_op要通过appendEntry函数进行，函数中特判了集群中仅有一个节点的情况
+	// bug: 提交no_op要通过appendEntry函数进行，函数中额外特判了集群中仅有一个节点的情况
 	r._appendEntry([]*pb.Entry{&no_op})
 	r._send_append_to_all()
 }
@@ -530,7 +560,6 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
-	// fmt.Println(m.Term, r.Term)
 	if m.Term < r.Term {
 		r.sendAppendResponse(m.From, true, m.Index)
 		return
@@ -624,6 +653,7 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 			r._send_append_to_all()
 		}
 
+		//
 		if !isCommit && r.RaftLog.LastIndex() >= newNextIndex {
 			r.sendAppend(m.From)
 		}
@@ -690,8 +720,75 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 }
 
 // handleSnapshot handle Snapshot RPC request
+/* 
+Snapshot消息没有单独的SnapshotResponse,而是发送AppendResponse
+
+leader收到AppendResponse之后，如果reject==false，那么会根据传回来的Index更新matchIndex
+所以handleSnapshot发送的AppendResponse里：
+- reject = false
+- index  = 已知的和Leader日志完全相同的最大的Index（r.RaftLog.committed）
+*/
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	if m.Term < r.Term {
+		r.sendAppendResponse(m.From, false, r.RaftLog.committed)
+		return
+	}
+
+	if m.Term > r.Term {
+		lead := None
+		// 如果是心跳或者AppendEntries，则可以判定当前任期的leader
+		// 如果不是这两种RPC，则无法判定leader
+		if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat || m.MsgType == pb.MessageType_MsgSnapshot {
+			lead = m.From
+		}
+		r.becomeFollower(m.Term, lead)
+	}
+
+	// 此时m.Term == r.Term
+	if r.Term != m.Term {
+		panic("incorrect term where receive requestvotes response")
+	}
+
+	r.becomeFollower(m.Term, m.From)
+
+	lastIncludedIndex := m.Snapshot.Metadata.Index
+	lastIncludedTerm := m.Snapshot.Metadata.Term
+	if lastIncludedIndex < r.RaftLog.FirstIndex() {
+		r.sendAppendResponse(m.From, false, r.RaftLog.committed)
+		return
+	}
+
+	// 删除RaftLog.entries中被snapshot包含的日志
+	// 下面的写法能保证旧的r.RaftLog.entries被GC掉，而直接使用切片不能
+	dummyIndex := r.RaftLog.FirstIndex() - 1
+	entries := make([]pb.Entry, 1)
+	entries[0] = pb.Entry{Index: lastIncludedIndex, Term: lastIncludedTerm}
+	if lastIncludedIndex < r.RaftLog.LastIndex() {
+		for _, entry := range r.RaftLog.entries[lastIncludedIndex-dummyIndex+1:] {
+			entries = append(entries, entry)
+		}
+	}
+	r.RaftLog.entries = entries
+
+	// update applied, committed, stabled
+	r.RaftLog.applied = max(r.RaftLog.applied, lastIncludedIndex)
+	r.RaftLog.committed = max(r.RaftLog.committed, lastIncludedIndex)
+	r.RaftLog.stabled = max(r.RaftLog.stabled, lastIncludedIndex)
+
+	// 集群节点变更
+	snapshotConf := m.Snapshot.Metadata.ConfState
+	if snapshotConf != nil {
+		r.Prs = make(map[uint64]*Progress)
+		for _, node := range snapshotConf.Nodes {
+			r.Prs[node] = &Progress{}
+			r.Prs[node].Next = r.RaftLog.LastIndex() + 1
+			r.Prs[node].Match = 0
+		}
+	}
+
+	r.RaftLog.pendingSnapshot = m.Snapshot
+	r.sendAppendResponse(m.From, false, r.RaftLog.committed)
 }
 
 // addNode add a new node to raft group
@@ -769,6 +866,9 @@ func (r *Raft) _follower_step(m pb.Message) error {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse:
 		// nothing to do
+	case pb.MessageType_MsgSnapshot:
+		// snapshot responses are handled in AppendResponse
+		r.handleSnapshot(m)
 	default:
 		return errors.New("invalid request")
 	}
@@ -789,7 +889,9 @@ func (r *Raft) _candidate_step(m pb.Message) error {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse:
 		// candidate收到heartbeat response，response的任期一定小于当前任期
-
+	case pb.MessageType_MsgSnapshot:
+		// snapshot responses are handled in AppendResponse
+		r.handleSnapshot(m)
 	default:
 		return errors.New("invalid request")
 	}
@@ -810,6 +912,8 @@ func (r *Raft) _leader_step(m pb.Message) error {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse:
 		r.handleHeartbeatResponse(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	default:
 		return errors.New("invalid request")
 	}

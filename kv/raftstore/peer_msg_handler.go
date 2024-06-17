@@ -49,7 +49,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	raft_group := d.peer.RaftGroup
 	if raft_group.HasReady() {
 		ready := raft_group.Ready()
-
+		// 肯定是先应用Snapshot，然后应用日志
 		d.peerStorage.SaveReadyState(&ready)
 		d.Send(d.ctx.trans, ready.Messages)
 		if len(ready.CommittedEntries) > 0 {
@@ -128,6 +128,22 @@ func (d *peerMsgHandler) ApplyEntries(entries []eraftpb.Entry) error {
 				// 发送Response
 				d.processProposal(entry, cmdResponse)
 				// d.sendProposal()
+			} else {
+				// 处理AdminRequest
+				req := reqs.AdminRequest
+				switch req.CmdType {
+				case raft_cmdpb.AdminCmdType_CompactLog:
+					d.execCompactLog(req, cmdResponse, kvWB)
+				}
+				d.peerStorage.applyState.AppliedIndex = entry.Index
+				kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+				err := d.peerStorage.Engines.WriteKV(kvWB)
+				if err != nil {
+					panic(err)
+				}
+
+				// 发送Response
+				d.processProposal(entry, cmdResponse)
 			}
 
 		case eraftpb.EntryType_EntryConfChange:
@@ -213,7 +229,20 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		d.peer.proposals = append(d.peer.proposals, p)
 		d.RaftGroup.Propose(data)
 	} else {
-		panic("还没实现adminrequest")
+
+		switch msg.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			// 不能在这里直接执行Snapshot，因为只有leader才会发起CompactLog请求
+			// 要将compactLog请求加入到raft日志中，在各个节点达成共识，都指向CompactLog
+			data, err := msg.Marshal()
+			if err != nil {
+				log.Panic(err)
+			}
+			p := &proposal{index: d.nextProposalIndex(), term: d.Term(), cb: cb}
+			d.proposals = append(d.proposals, p)
+			d.RaftGroup.Propose(data)
+		}
+
 	}
 }
 
@@ -268,6 +297,21 @@ func (d *peerMsgHandler) execSnap(req *raft_cmdpb.Request, resp *raft_cmdpb.Raft
 	resp.Responses = append(resp.Responses, snap_resp)
 }
 
+func (d *peerMsgHandler) execCompactLog(req *raft_cmdpb.AdminRequest, resp *raft_cmdpb.RaftCmdResponse, kvWB *engine_util.WriteBatch) {
+	compactIndex := req.CompactLog.CompactIndex
+	compactTerm  := req.CompactLog.CompactTerm
+
+	if compactIndex > d.peerStorage.applyState.TruncatedState.Index {
+		d.peerStorage.applyState.TruncatedState.Index = compactIndex
+		d.peerStorage.applyState.TruncatedState.Term = compactTerm
+		err := kvWB.SetMeta(meta.ApplyStateKey(d.Region().GetId()), d.peerStorage.applyState)
+		if err != nil {
+			log.Panic(err)
+		}
+		d.ScheduleCompactLog(compactIndex)
+	}
+}
+
 /*
 只有leader会进行propose过程，并在d.proposal中加入callback
 但是无论leader还是follower，在apply时都会执行下面的函数
@@ -305,7 +349,7 @@ func (d *peerMsgHandler) processProposal(entry eraftpb.Entry, response *raft_cmd
 			if response.Header == nil {
 				response.Header = &raft_cmdpb.RaftResponseHeader{}
 			}
-			
+
 			// Only For 2C
 			for _, resp := range response.Responses {
 				if resp.CmdType == raft_cmdpb.CmdType_Snap {
@@ -634,7 +678,7 @@ func (d *peerMsgHandler) onRaftGCLogTick() {
 
 	term, err := d.RaftGroup.Raft.RaftLog.Term(compactIdx)
 	if err != nil {
-		log.Fatalf("appliedIdx: %d, firstIdx: %d, compactIdx: %d", appliedIdx, firstIdx, compactIdx)
+		log.Fatalf("appliedIdx: %d, firstIdx: %d, compactIdx: %d lastIdx: %d", appliedIdx, firstIdx, compactIdx, d.RaftGroup.Raft.RaftLog.LastIndex())
 		panic(err)
 	}
 
